@@ -2,10 +2,9 @@ from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing, QgsProcessingAlgorithm,
     QgsProcessingParameterFeatureSource, QgsProcessingParameterRasterLayer,
-    QgsProcessingParameterNumber, QgsProcessingParameterBoolean,
-    QgsProcessingException, QgsVectorLayer, QgsVectorDataProvider,
-    QgsField, QgsPointXY, QgsCoordinateTransform, QgsDistanceArea,
-    QgsProject, QgsRaster
+    QgsProcessingParameterNumber, QgsProcessingException,
+    QgsVectorLayer, QgsVectorDataProvider, QgsField, QgsPointXY,
+    QgsCoordinateTransform, QgsRaster
 )
 from PyQt5.QtCore import QVariant
 import math
@@ -15,13 +14,12 @@ class SampleRasterAtLineEndpoints(QgsProcessingAlgorithm):
     INPUT_RASTER_LAYER = 'INPUT_RASTER_LAYER'
     INPUT_BAND = 'INPUT_BAND'
     VERT_UNIT_FACTOR = 'VERT_UNIT_FACTOR'
-    USE_GEODESIC = 'USE_GEODESIC'
     OUTPUT_LAYER = 'OUTPUT_LAYER'  # just to return the edited layer id
 
     def tr(self, s): return QCoreApplication.translate('SampleRasterAtLineEndpoints', s)
     def createInstance(self): return SampleRasterAtLineEndpoints()
     def name(self): return 'sampleRasterAtLineEndpoints_inplace'
-    def displayName(self): return self.tr('Sample Raster at Line Endpoints')
+    def displayName(self): return self.tr('Sample Raster at Line Endpoints (Edit In-Place)')
     def group(self): return self.tr('Custom Scripts')
     def groupId(self): return 'customscripts'
 
@@ -36,15 +34,12 @@ class SampleRasterAtLineEndpoints(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterNumber(
             self.VERT_UNIT_FACTOR, self.tr('Vertical conversion factor (multiplies sampled values)'),
             type=QgsProcessingParameterNumber.Double, defaultValue=1.0))
-        self.addParameter(QgsProcessingParameterBoolean(
-            self.USE_GEODESIC, self.tr('Measure length geodesically in meters'), defaultValue=True))
 
     def processAlgorithm(self, parameters, context, feedback):
         line_layer = self.parameterAsVectorLayer(parameters, self.INPUT_LINE_LAYER, context)
         raster_layer = self.parameterAsRasterLayer(parameters, self.INPUT_RASTER_LAYER, context)
         band = self.parameterAsInt(parameters, self.INPUT_BAND, context)
         vert_factor = self.parameterAsDouble(parameters, self.VERT_UNIT_FACTOR, context)
-        use_geodesic = self.parameterAsBoolean(parameters, self.USE_GEODESIC, context)
 
         if not isinstance(line_layer, QgsVectorLayer) or not line_layer.isValid():
             raise QgsProcessingException(self.invalidSourceError(parameters, self.INPUT_LINE_LAYER))
@@ -58,7 +53,7 @@ class SampleRasterAtLineEndpoints(QgsProcessingAlgorithm):
         if not (caps & QgsVectorDataProvider.ChangeAttributeValues):
             raise QgsProcessingException(self.tr('Layer does not allow changing attribute values.'))
 
-        # Band sanity
+        # Sanity check for band
         try:
             bc = raster_layer.dataProvider().bandCount()
             if band > bc:
@@ -86,19 +81,14 @@ class SampleRasterAtLineEndpoints(QgsProcessingAlgorithm):
         idx_slope = line_layer.fields().indexFromName('Slope')
         idx_len   = line_layer.fields().indexFromName('Length')
 
-        # Transform & measurer
+        # Transform for sampling: line CRS -> raster CRS
         try:
             to_raster_ct = QgsCoordinateTransform(line_layer.crs(), raster_layer.crs(), context.transformContext())
         except Exception as e:
             if started_edit: line_layer.rollBack()
             raise QgsProcessingException(self.tr(f'Failed to build coordinate transform: {e}'))
 
-        dist = QgsDistanceArea()
-        dist.setSourceCrs(line_layer.crs(), context.transformContext())
-        ellipsoid = QgsProject.instance().ellipsoid() or 'WGS84'
-        dist.setEllipsoid(ellipsoid if use_geodesic else 'NONE')
-
-        # Nudge size ~¾ px
+        # Nudge size (~¾ pixel in raster CRS)
         try:
             px = abs(raster_layer.rasterUnitsPerPixelX())
             py = abs(raster_layer.rasterUnitsPerPixelY())
@@ -121,13 +111,16 @@ class SampleRasterAtLineEndpoints(QgsProcessingAlgorithm):
 
             try:
                 if not geom.isGeosValid(): geom = geom.makeValid()
-            except Exception: pass
+            except Exception:
+                pass
 
+            # Robust endpoints for any line type (curved, multi, Z/M)
             start_pt, end_pt = self._robust_endpoints(geom)
             if start_pt is None or end_pt is None:
                 self._apply_attrs(line_layer, feat, idx_start, idx_end, idx_slope, idx_len, None, None, None, None, feedback)
                 processed += 1; feedback.setProgress(100.0 * processed / max(total,1)); continue
 
+            # Transform to raster CRS and sample (with nudge fallback)
             try:
                 s_r = to_raster_ct.transform(QgsPointXY(start_pt))
                 e_r = to_raster_ct.transform(QgsPointXY(end_pt))
@@ -147,8 +140,9 @@ class SampleRasterAtLineEndpoints(QgsProcessingAlgorithm):
             if start_val is not None: start_val *= vert_factor
             if end_val   is not None: end_val   *= vert_factor
 
+            # Length in the line layer's CRS units
             try:
-                length = dist.measureLength(geom)
+                length = geom.length()
             except Exception:
                 length = None
 
@@ -172,7 +166,6 @@ class SampleRasterAtLineEndpoints(QgsProcessingAlgorithm):
                 line_layer.rollBack()
                 raise QgsProcessingException(self.tr('Commit failed; changes were rolled back.'))
 
-        # Force UI refresh in some cases (GPKG+OneDrive can be sluggish)
         try:
             line_layer.triggerRepaint()
         except Exception:
@@ -182,7 +175,6 @@ class SampleRasterAtLineEndpoints(QgsProcessingAlgorithm):
 
     # ---------- helpers ----------
     def _apply_attrs(self, layer, feat, i_s, i_e, i_m, i_l, sv, ev, sl, ln, feedback):
-        """Write values robustly: per-field change; if that fails, fall back to updateFeature()."""
         ok = True
         try:
             ok &= layer.changeAttributeValue(feat.id(), i_s, sv)
@@ -191,20 +183,16 @@ class SampleRasterAtLineEndpoints(QgsProcessingAlgorithm):
             ok &= layer.changeAttributeValue(feat.id(), i_l, ln)
         except Exception:
             ok = False
-
         if not ok:
-            # Fallback path
             try:
                 f2 = feat
-                # copy current attrs, set only our fields
                 attrs = f2.attributes()
                 if i_s >= 0: attrs[i_s] = sv
                 if i_e >= 0: attrs[i_e] = ev
                 if i_m >= 0: attrs[i_m] = sl
                 if i_l >= 0: attrs[i_l] = ln
                 f2.setAttributes(attrs)
-                ok2 = layer.updateFeature(f2)
-                if not ok2:
+                if not layer.updateFeature(f2):
                     feedback.pushInfo(f"Write failed on FID {feat.id()} (both paths).")
             except Exception:
                 feedback.pushInfo(f"Write exception on FID {feat.id()}.")
@@ -257,5 +245,5 @@ class SampleRasterAtLineEndpoints(QgsProcessingAlgorithm):
     def shortHelpString(self):
         return self.tr(
             "Edits the input line layer in place and writes StartVal/EndVal/Slope/Length. "
-            "Uses per-field updates (safer on GPKG/OGR) with a fallback via updateFeature()."
+            "Length is measured directly from the geometry (layer CRS units)."
         )
